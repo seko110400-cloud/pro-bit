@@ -16,26 +16,21 @@ from flask import Flask, jsonify
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+BYBIT_KLINE_URL = "https://api.bybit.com/v5/market/kline"
+BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
+
 SYMBOLS = [
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT"
 ]
 
-# Struktur analizi üçün candle
 TIMEFRAME = "15"
-
-# Neçə candle saxlanılsın
 MAX_CANDLES = 200
 
-# Risk / Reward
 RR = 2.0
 
-# SQLite
 DB_FILE = "trades.db"
-
-# Bybit public linear websocket
-WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
 
 # ============================================================
@@ -82,14 +77,14 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            side TEXT,
-            entry REAL,
-            stop_loss REAL,
-            take_profit REAL,
-            status TEXT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry REAL NOT NULL,
+            stop_loss REAL NOT NULL,
+            take_profit REAL NOT NULL,
+            status TEXT NOT NULL,
             exit_price REAL,
-            created_at REAL,
+            created_at REAL NOT NULL,
             closed_at REAL
         )
     """)
@@ -97,8 +92,20 @@ def init_db():
     conn.commit()
     conn.close()
 
+    print("✅ SQLite database hazır.")
+
+
+# DATABASE-İ PROQRAM BAŞLAMAMIŞDAN ƏVVƏL YARAT
+init_db()
+
+
+# ============================================================
+# DATABASE - SAVE TRADE
+# ============================================================
 
 def save_trade(trade):
+
+    init_db()
 
     conn = sqlite3.connect(DB_FILE)
 
@@ -140,9 +147,13 @@ def save_trade(trade):
 
 def send_telegram(message):
 
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram ENV dəyişənləri yoxdur.")
-        return
+    if not TELEGRAM_BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN yoxdur.")
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+        print("❌ TELEGRAM_CHAT_ID yoxdur.")
+        return False
 
     url = (
         f"https://api.telegram.org/"
@@ -165,19 +176,108 @@ def send_telegram(message):
         data = response.json()
 
         if data.get("ok"):
-            print("Telegram: OK")
-        else:
-            print("Telegram error:", data)
+            print("✅ Telegram mesajı göndərildi.")
+            return True
+
+        print("❌ Telegram xətası:", data)
 
     except Exception as e:
-        print("Telegram error:", e)
+
+        print(
+            "❌ Telegram bağlantı xətası:",
+            e
+        )
+
+    return False
 
 
 # ============================================================
-# INDICATORS
+# BYBIT HISTORICAL DATA
 # ============================================================
 
-def ema(values, period):
+def load_initial_candles(symbol):
+
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": TIMEFRAME,
+        "limit": MAX_CANDLES
+    }
+
+    try:
+
+        response = requests.get(
+            BYBIT_KLINE_URL,
+            params=params,
+            timeout=15
+        )
+
+        data = response.json()
+
+        if data.get("retCode") != 0:
+
+            print(
+                f"❌ Bybit error {symbol}:",
+                data
+            )
+
+            return
+
+        rows = data["result"]["list"]
+
+        rows.reverse()
+
+        loaded = []
+
+        for row in rows:
+
+            candle = {
+                "time": int(row[0]),
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]),
+                "confirm": True
+            }
+
+            loaded.append(candle)
+
+        with lock:
+
+            candles[symbol] = loaded[-MAX_CANDLES:]
+
+        print(
+            f"📥 {symbol}: "
+            f"{len(loaded)} candle yükləndi."
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ {symbol} historical data xətası:",
+            e
+        )
+
+
+def load_all_initial_data():
+
+    print("📥 Bybit historical data yüklənir...")
+
+    for symbol in SYMBOLS:
+
+        load_initial_candles(symbol)
+
+        time.sleep(0.5)
+
+    print("✅ Historical data hazırdır.")
+
+
+# ============================================================
+# EMA
+# ============================================================
+
+def calculate_ema(values, period):
 
     if len(values) < period:
         return None
@@ -187,24 +287,30 @@ def ema(values, period):
     result = values[0]
 
     for value in values[1:]:
+
         result = (
-            value - result
-        ) * multiplier + result
+            (value - result) * multiplier
+        ) + result
 
     return result
 
 
-def atr(data, period=14):
+# ============================================================
+# ATR
+# ============================================================
+
+def calculate_atr(data, period=14):
 
     if len(data) < period + 1:
         return None
 
-    trs = []
+    true_ranges = []
 
     for i in range(1, len(data)):
 
         high = data[i]["high"]
         low = data[i]["low"]
+
         previous_close = data[i - 1]["close"]
 
         tr = max(
@@ -213,29 +319,18 @@ def atr(data, period=14):
             abs(low - previous_close)
         )
 
-        trs.append(tr)
+        true_ranges.append(tr)
 
-    if len(trs) < period:
+    if len(true_ranges) < period:
         return None
 
-    return sum(trs[-period:]) / period
+    return sum(
+        true_ranges[-period:]
+    ) / period
 
 
 # ============================================================
-# REAL-TIME PRICE
-# ============================================================
-
-def update_price(symbol, price):
-
-    with lock:
-
-        current_prices[symbol] = price
-
-    check_trade(symbol, price)
-
-
-# ============================================================
-# SMC ANALYSIS
+# REAL-TIME SMC ANALYSIS
 # ============================================================
 
 def analyze_symbol(symbol):
@@ -244,12 +339,12 @@ def analyze_symbol(symbol):
 
         data = list(candles[symbol])
 
-    # Yetərli data yoxdursa
     if len(data) < 60:
         return None
 
-    # Son candle artıq bağlanmış candle olmalıdır.
+    # Son bağlanmış candle
     current = data[-1]
+
     previous = data[-2]
 
     # Son 10 candle
@@ -258,49 +353,57 @@ def analyze_symbol(symbol):
     if len(lookback) < 5:
         return None
 
-    highs = [
-        candle["high"]
-        for candle in lookback
-    ]
-
-    lows = [
-        candle["low"]
-        for candle in lookback
-    ]
-
-    recent_high = max(highs)
-    recent_low = min(lows)
+    # ========================================================
+    # EMA
+    # ========================================================
 
     closes = [
-        candle["close"]
-        for candle in data
+        x["close"]
+        for x in data
     ]
 
-    ema20 = ema(
+    ema20 = calculate_ema(
         closes[-80:],
         20
     )
 
-    ema50 = ema(
+    ema50 = calculate_ema(
         closes[-100:],
         50
     )
 
-    current_atr = atr(data)
-
-    if (
-        ema20 is None
-        or ema50 is None
-        or current_atr is None
-        or current_atr <= 0
-    ):
+    if ema20 is None or ema50 is None:
         return None
+
+    # ========================================================
+    # ATR
+    # ========================================================
+
+    current_atr = calculate_atr(data)
+
+    if current_atr is None or current_atr <= 0:
+        return None
+
+    # ========================================================
+    # STRUCTURE
+    # ========================================================
+
+    recent_high = max(
+        x["high"]
+        for x in lookback
+    )
+
+    recent_low = min(
+        x["low"]
+        for x in lookback
+    )
 
     # ========================================================
     # TREND
     # ========================================================
 
     bullish_trend = ema20 > ema50
+
     bearish_trend = ema20 < ema50
 
     # ========================================================
@@ -335,16 +438,18 @@ def analyze_symbol(symbol):
     # VOLUME
     # ========================================================
 
-    volumes = [
-        candle["volume"]
-        for candle in data[-21:-1]
+    previous_volumes = [
+        x["volume"]
+        for x in data[-21:-1]
     ]
 
-    if not volumes:
+    if not previous_volumes:
         return None
 
     average_volume = (
-        sum(volumes) / len(volumes)
+        sum(previous_volumes)
+        /
+        len(previous_volumes)
     )
 
     volume_confirmation = (
@@ -370,7 +475,8 @@ def analyze_symbol(symbol):
                 current["low"],
                 recent_low
             )
-            - current_atr * 0.20
+            -
+            current_atr * 0.20
         )
 
         risk = entry - sl
@@ -389,7 +495,7 @@ def analyze_symbol(symbol):
             "sl": sl,
             "tp": tp,
             "candle_time": current["time"],
-            "reason": [
+            "reasons": [
                 "Liquidity Sweep",
                 "Bullish BOS",
                 "EMA Trend",
@@ -415,7 +521,8 @@ def analyze_symbol(symbol):
                 current["high"],
                 recent_high
             )
-            + current_atr * 0.20
+            +
+            current_atr * 0.20
         )
 
         risk = sl - entry
@@ -434,7 +541,7 @@ def analyze_symbol(symbol):
             "sl": sl,
             "tp": tp,
             "candle_time": current["time"],
-            "reason": [
+            "reasons": [
                 "Liquidity Sweep",
                 "Bearish BOS",
                 "EMA Trend",
@@ -455,15 +562,17 @@ def create_signal(signal):
 
     with lock:
 
+        # Eyni symbol-da aktiv trade varsa
         if symbol in active_trades:
             return
 
         candle_time = signal["candle_time"]
 
-        # Eyni candle-dan ikinci signal vermə
+        # Eyni candle üçün ikinci signal yox
         if (
             last_signal_candle[symbol]
-            == candle_time
+            ==
+            candle_time
         ):
             return
 
@@ -488,20 +597,26 @@ def create_signal(signal):
     )
 
     reasons = "\n".join(
-        "✅ " + x
-        for x in signal["reason"]
+        "✅ " + reason
+        for reason in signal["reasons"]
     )
 
     message = f"""
-🚨 SMC PRO REAL-TIME SIGNAL
+🚨 SMC PRO SIGNAL
 
 {emoji} {symbol} {trade["side"]}
 
-Entry: {trade["entry"]:.6f}
-SL: {trade["sl"]:.6f}
-TP: {trade["tp"]:.6f}
+Entry:
+{trade["entry"]:.6f}
 
-RR: 1:{RR}
+Stop Loss:
+{trade["sl"]:.6f}
+
+Take Profit:
+{trade["tp"]:.6f}
+
+Risk / Reward:
+1:{RR}
 
 {reasons}
 
@@ -514,7 +629,7 @@ RR: 1:{RR}
 
 
 # ============================================================
-# TP / SL MONITOR
+# TP / SL CHECK
 # ============================================================
 
 def check_trade(symbol, price):
@@ -526,26 +641,34 @@ def check_trade(symbol, price):
     if not trade:
         return
 
-    side = trade["side"]
-
     result = None
 
+    # ========================================================
     # LONG
-    if side == "LONG":
+    # ========================================================
+
+    if trade["side"] == "LONG":
 
         if price >= trade["tp"]:
+
             result = "WIN"
 
         elif price <= trade["sl"]:
+
             result = "LOSS"
 
+    # ========================================================
     # SHORT
-    elif side == "SHORT":
+    # ========================================================
+
+    elif trade["side"] == "SHORT":
 
         if price <= trade["tp"]:
+
             result = "WIN"
 
         elif price >= trade["sl"]:
+
             result = "LOSS"
 
     if result is None:
@@ -564,27 +687,34 @@ def check_trade(symbol, price):
 
     save_trade(trade)
 
-    send_result(trade)
+    print(
+        f"🏁 {symbol} -> {result}"
+    )
+
+    send_result_message(trade)
 
 
 # ============================================================
-# RESULT
+# RESULT MESSAGE
 # ============================================================
 
-def send_result(trade):
+def send_result_message(trade):
 
-    result = trade["status"]
-
-    if result == "WIN":
+    if trade["status"] == "WIN":
 
         message = f"""
 ✅ TP HIT
 
 {trade["symbol"]} {trade["side"]}
 
-Entry: {trade["entry"]:.6f}
-TP: {trade["tp"]:.6f}
-Exit: {trade["exit_price"]:.6f}
+Entry:
+{trade["entry"]:.6f}
+
+TP:
+{trade["tp"]:.6f}
+
+Exit:
+{trade["exit_price"]:.6f}
 
 RESULT: WIN 🟢
 """
@@ -596,9 +726,14 @@ RESULT: WIN 🟢
 
 {trade["symbol"]} {trade["side"]}
 
-Entry: {trade["entry"]:.6f}
-SL: {trade["sl"]:.6f}
-Exit: {trade["exit_price"]:.6f}
+Entry:
+{trade["entry"]:.6f}
+
+SL:
+{trade["sl"]:.6f}
+
+Exit:
+{trade["exit_price"]:.6f}
 
 RESULT: LOSS 🔴
 """
@@ -614,6 +749,10 @@ RESULT: LOSS 🔴
 
 def get_statistics():
 
+    # ƏSAS DÜZƏLİŞ:
+    # Cədvəl yoxdursa əvvəlcə yaradır.
+    init_db()
+
     conn = sqlite3.connect(DB_FILE)
 
     cursor = conn.cursor()
@@ -621,19 +760,25 @@ def get_statistics():
     cursor.execute("""
         SELECT
             COUNT(*),
-            SUM(
-                CASE
-                    WHEN status = 'WIN'
-                    THEN 1
-                    ELSE 0
-                END
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN status = 'WIN'
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
             ),
-            SUM(
-                CASE
-                    WHEN status = 'LOSS'
-                    THEN 1
-                    ELSE 0
-                END
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN status = 'LOSS'
+                        THEN 1
+                        ELSE 0
+                    END
+                ),
+                0
             )
         FROM trades
     """)
@@ -647,10 +792,13 @@ def get_statistics():
     losses = row[2] or 0
 
     if total > 0:
+
         win_rate = (
             wins / total
         ) * 100
+
     else:
+
         win_rate = 0
 
     return {
@@ -664,6 +812,10 @@ def get_statistics():
     }
 
 
+# ============================================================
+# TELEGRAM STATISTICS
+# ============================================================
+
 def send_statistics():
 
     stats = get_statistics()
@@ -671,9 +823,14 @@ def send_statistics():
     message = f"""
 📊 SMC BOT STATISTICS
 
-Total: {stats["total"]}
-WIN: {stats["wins"]}
-LOSS: {stats["losses"]}
+Total Trades:
+{stats["total"]}
+
+WIN:
+{stats["wins"]}
+
+LOSS:
+{stats["losses"]}
 
 Win Rate:
 {stats["win_rate"]}%
@@ -683,7 +840,7 @@ Win Rate:
 
 
 # ============================================================
-# BYBIT WEBSOCKET
+# WEBSOCKET MESSAGE
 # ============================================================
 
 def on_message(ws, message):
@@ -697,9 +854,9 @@ def on_message(ws, message):
             ""
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # KLINE
-        # ----------------------------------------------------
+        # ====================================================
 
         if topic.startswith("kline."):
 
@@ -738,32 +895,34 @@ def on_message(ws, message):
 
                 with lock:
 
-                    existing = candles[
+                    data_list = candles[
                         symbol
                     ]
 
-                    # Eyni candle-ı yenilə
                     if (
-                        existing
+                        data_list
                         and
-                        existing[-1]["time"]
-                        == candle["time"]
+                        data_list[-1]["time"]
+                        ==
+                        candle["time"]
                     ):
 
-                        existing[-1] = candle
+                        data_list[-1] = candle
 
                     else:
 
-                        existing.append(
+                        data_list.append(
                             candle
                         )
 
-                    if len(existing) > MAX_CANDLES:
-                        del existing[
+                    if len(data_list) > MAX_CANDLES:
+
+                        del data_list[
                             :-MAX_CANDLES
                         ]
 
-                # Yalnız candle bağlananda analiz
+                # YALNIZ CANDLE BAĞLANANDA
+                # YENİ SETUP AXTAR
                 if candle["confirm"]:
 
                     signal = analyze_symbol(
@@ -771,61 +930,60 @@ def on_message(ws, message):
                     )
 
                     if signal:
+
                         create_signal(
                             signal
                         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # TICKER
-        # ----------------------------------------------------
+        # ====================================================
 
         elif topic.startswith("tickers."):
 
             symbol = topic.split(".")[-1]
 
-            items = data.get(
+            ticker_data = data.get(
                 "data",
                 {}
             )
 
-            last_price = items.get(
+            price = ticker_data.get(
                 "lastPrice"
             )
 
-            if last_price:
+            if price:
 
-                update_price(
+                price = float(price)
+
+                with lock:
+
+                    current_prices[
+                        symbol
+                    ] = price
+
+                # TP / SL REAL-TIME
+                check_trade(
                     symbol,
-                    float(last_price)
+                    price
                 )
 
     except Exception as e:
 
         print(
-            "WebSocket message error:",
+            "❌ WebSocket message error:",
             e
         )
 
 
-def on_error(ws, error):
-
-    print(
-        "WebSocket error:",
-        error
-    )
-
-
-def on_close(ws, close_status_code, close_msg):
-
-    print(
-        "WebSocket bağlandı."
-    )
-
+# ============================================================
+# WEBSOCKET OPEN
+# ============================================================
 
 def on_open(ws):
 
     print(
-        "🚀 Bybit WebSocket connected."
+        "✅ Bybit WebSocket bağlantısı aktivdir."
     )
 
     topics = []
@@ -850,10 +1008,41 @@ def on_open(ws):
     )
 
     print(
-        "Subscribed:",
+        "📡 Subscribed:",
         topics
     )
 
+
+# ============================================================
+# WEBSOCKET ERROR
+# ============================================================
+
+def on_error(ws, error):
+
+    print(
+        "❌ WebSocket error:",
+        error
+    )
+
+
+# ============================================================
+# WEBSOCKET CLOSE
+# ============================================================
+
+def on_close(
+    ws,
+    close_status_code,
+    close_msg
+):
+
+    print(
+        "⚠️ WebSocket bağlantısı bağlandı."
+    )
+
+
+# ============================================================
+# WEBSOCKET WORKER
+# ============================================================
 
 def websocket_worker():
 
@@ -862,7 +1051,7 @@ def websocket_worker():
         try:
 
             ws = websocket.WebSocketApp(
-                WS_URL,
+                BYBIT_WS_URL,
                 on_open=on_open,
                 on_message=on_message,
                 on_error=on_error,
@@ -877,12 +1066,13 @@ def websocket_worker():
         except Exception as e:
 
             print(
-                "WebSocket restart:",
+                "❌ WebSocket worker error:",
                 e
             )
 
         print(
-            "5 saniyə sonra yenidən qoşulur..."
+            "🔄 5 saniyədən sonra "
+            "WebSocket yenidən qoşulur..."
         )
 
         time.sleep(5)
@@ -894,8 +1084,14 @@ def websocket_worker():
 
 def startup():
 
-    init_db()
+    print(
+        "🚀 SMC PRO BOT BAŞLAYIR..."
+    )
 
+    # Əvvəl tarixi candle-ları götür
+    load_all_initial_data()
+
+    # Sonra WebSocket başlat
     thread = threading.Thread(
         target=websocket_worker,
         daemon=True
@@ -905,15 +1101,16 @@ def startup():
 
     send_telegram(
         "🚀 SMC PRO REAL-TIME BOT AKTİVDİR!\n\n"
-        "📡 Bybit WebSocket bağlantısı aktivdir.\n"
+        "📡 Bybit WebSocket bağlantısı hazırlanır.\n"
         "🔎 BTCUSDT / ETHUSDT / SOLUSDT izlənilir.\n"
-        "📊 SMC setup-ları real-time yoxlanılır.\n"
-        "🎯 TP/SL avtomatik izlənilir."
+        "📊 SMC + Liquidity Sweep + BOS + EMA + Volume\n"
+        "🎯 TP/SL real-time izlənilir.\n"
+        "💾 WIN/LOSS SQLite-də saxlanılır."
     )
 
 
 # ============================================================
-# FLASK ROUTES
+# ROUTES
 # ============================================================
 
 @app.route("/")
@@ -921,13 +1118,18 @@ def home():
 
     stats = get_statistics()
 
+    with lock:
+
+        active_count = len(
+            active_trades
+        )
+
     return jsonify({
         "status": "online",
         "mode": "REAL-TIME",
         "symbols": SYMBOLS,
-        "active_trades": len(
-            active_trades
-        ),
+        "timeframe": TIMEFRAME,
+        "active_trades": active_count,
         "statistics": stats
     })
 
