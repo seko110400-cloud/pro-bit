@@ -63,6 +63,10 @@ last_signal_candle = {
 
 lock = threading.Lock()
 
+# Startup-un yalniz 1 defe islemesi ucun (gunicorn coxlu worker/thread hallari ucun)
+_startup_done = False
+_startup_lock = threading.Lock()
+
 
 # ============================================================
 # DATABASE
@@ -111,6 +115,9 @@ def save_trade(trade):
 
     cursor = conn.cursor()
 
+    # DUZELDILDI: sutun sayi 9-dur, bunun ucun 9 placeholder ("?") lazimdir.
+    # Evvelki versiyada 10 "?" var idi amma 9 deyer gonderilirdi -> ProgrammingError
+    # bu xeta save_trade-i cokdururdu ve WIN/LOSS Telegram mesaji hec vaxt getmirdi.
     cursor.execute("""
         INSERT INTO trades
         (
@@ -124,7 +131,7 @@ def save_trade(trade):
             created_at,
             closed_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         trade["symbol"],
         trade["side"],
@@ -685,7 +692,14 @@ def check_trade(symbol, price):
             None
         )
 
-    save_trade(trade)
+    # DUZELDILDI: save_trade artiq patlamir, amma yene de qorunma
+    # eslinde try/except elave edildi ki, DB xetasi Telegram bildirisini
+    # bloklamasin (evvelki versiyada save_trade patlayanda
+    # send_result_message hec vaxt cagirilmirdi).
+    try:
+        save_trade(trade)
+    except Exception as e:
+        print("❌ save_trade xətası:", e)
 
     print(
         f"🏁 {symbol} -> {result}"
@@ -1084,6 +1098,15 @@ def websocket_worker():
 
 def startup():
 
+    global _startup_done
+
+    with _startup_lock:
+
+        if _startup_done:
+            return
+
+        _startup_done = True
+
     print(
         "🚀 SMC PRO BOT BAŞLAYIR..."
     )
@@ -1164,9 +1187,16 @@ def active():
 # MAIN
 # ============================================================
 
-if __name__ == "__main__":
+# DUZELDILDI: startup() artiq modul import olunan an cagirilir (Flask app
+# yaradilandan deraha sonra), "if __name__ == '__main__':" blokunun
+# ICINDE DEYIL. Bu vacibdir cunki Render.com-da adeten proqram
+# "gunicorn app:app" kimi bir WSGI server ile isledilir, "python app.py"
+# ile deyil - bu halda __main__ bloku HEC VAXT ICRA OLUNMUR, deməli
+# startup() ve WebSocket thread-i hec basqamir, ona gore de siqnal ve
+# Telegram mesaji gelmirdi.
+startup()
 
-    startup()
+if __name__ == "__main__":
 
     port = int(
         os.getenv(
